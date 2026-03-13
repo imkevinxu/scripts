@@ -82,7 +82,9 @@ scan_claude_sessions() {
     printf '%s\t%s\t%s\t%s\n' "$hb_wt" "${hb_ts:-0}" "$sid" "$alive" >> "$TMP_ALL"
   done
 
-  [[ -s "$TMP_ALL" ]] && sort -t$'\t' -k1,1 -k2,2rn "$TMP_ALL" > "$CLAUDE_SESSION_MAP"
+  if [[ -s "$TMP_ALL" ]]; then
+    sort -t$'\t' -k1,1 -k2,2rn "$TMP_ALL" > "$CLAUDE_SESSION_MAP"
+  fi
 }
 
 get_claude_sessions() {
@@ -345,7 +347,7 @@ with open('$cache_file', 'w') as out:
 
   } | sed "s/$/$CLR_EOL/" > "$RENDER_FILE"
   TOTAL_LINES=0
-  while IFS= read -r _; do (( TOTAL_LINES++ )); done < "$RENDER_FILE"
+  while IFS= read -r _; do (( ++TOTAL_LINES )); done < "$RENDER_FILE"
 }
 
 SCROLL_OFFSET=0
