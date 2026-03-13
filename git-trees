@@ -41,6 +41,22 @@ TMP_FILES=("$CLAUDE_SESSION_MAP" "$RENDER_FILE" "$TMP_ALL" "$WT_LIST_FILE")
 # Shared state — set once per render cycle in render_to_file()
 NOW_TS=0
 AGE_COL=0
+FETCH_PID=""
+PR_MAP_FILE="$REPO_ROOT/.git/trees-pr-cache"
+PR_NUM=""
+PR_URL=""
+PR_STATE=""
+PR_CI=""
+
+# Sets PR_NUM, PR_URL, PR_STATE, and PR_CI for the given branch
+lookup_pr() {
+  PR_NUM="" PR_URL="" PR_STATE="" PR_CI=""
+  [[ -s "$PR_MAP_FILE" ]] || return 0
+  local line
+  line="$(grep "^${1}	" "$PR_MAP_FILE" 2>/dev/null | head -1 || true)"
+  [[ -n "$line" ]] || return 0
+  IFS=$'\t' read -r _ PR_NUM PR_URL PR_STATE PR_CI <<< "$line"
+}
 
 # Sets REPLY instead of echoing — avoids subshell fork at call sites
 format_age() {
@@ -162,6 +178,14 @@ print_status() {
   [[ "$branch" != "$label" ]] && show_branch=1
   calc_display_len "$label" "$branch"
   local display_len=$REPLY
+
+  # PR lookup
+  lookup_pr "$branch"
+  if [[ -n "$PR_NUM" ]]; then
+    (( display_len += 4 + ${#PR_NUM} ))
+    [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( display_len += 2 ))
+  fi
+
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
 
@@ -170,6 +194,18 @@ print_status() {
     printf "${name_color}${BOLD}%s${R} ${DIM}on${R} ${BOLD}%s${R}" "$label" "$branch"
   else
     printf "${name_color}${BOLD}%s${R}" "$label"
+  fi
+  if [[ -n "$PR_NUM" ]]; then
+    printf ' \033]8;;%s\007%s(#%s)%s\033]8;;\007' "$PR_URL" "$DIM" "$PR_NUM" "$R"
+    if [[ "$PR_STATE" == "MERGED" ]]; then
+      printf " ${MAGENTA}●${R}"
+    else
+      case "$PR_CI" in
+        pass)    printf " ${GREEN}✓${R}" ;;
+        fail)    printf " ${RED}✗${R}" ;;
+        pending) printf " ${YELLOW}○${R}" ;;
+      esac
+    fi
   fi
   printf "%-${pad}s" ""
   [[ -n "$age_str" ]] && printf "${DIM}%3s${R}" "$age_str"
@@ -225,8 +261,9 @@ render_to_file() {
     IFS= read -r last_fetch < "$fetch_stamp" 2>/dev/null || true
   fi
   if (( NOW_TS - last_fetch > 30 )); then
-    wait 2>/dev/null || true
+    [[ -n "${FETCH_PID:-}" ]] && wait "$FETCH_PID" 2>/dev/null || true
     git -C "$REPO_ROOT" fetch --quiet 2>/dev/null &
+    FETCH_PID=$!
     echo "$NOW_TS" > "$fetch_stamp" 2>/dev/null || true
   fi
 
@@ -313,11 +350,53 @@ with open('$cache_file', 'w') as out:
   local main_branch main_commit_ts
   main_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
   main_commit_ts="$(git -C "$REPO_ROOT" log -1 --format='%ct' 2>/dev/null || echo 0)"
+
+  # PR data — background per-branch fetch, persistent cache (throttled to every 60s)
+  local pr_stamp="$REPO_ROOT/.git/trees-pr-ts"
+  local last_pr=0
+  if [[ -f "$pr_stamp" ]]; then
+    IFS= read -r last_pr < "$pr_stamp" 2>/dev/null || true
+  fi
+  if (( NOW_TS - last_pr > 60 )); then
+    echo "$NOW_TS" > "$pr_stamp" 2>/dev/null || true
+    local pr_branches=("$main_branch")
+    while IFS=$'\t' read -r _ _ _ _ wb; do
+      pr_branches+=("$wb")
+    done < "$WT_LIST_FILE"
+    (
+      local pr_tmp; pr_tmp="$(mktemp)"
+      local jq_expr='.[] | [.headRefName, (.number | tostring), .url, .state, (
+        (.statusCheckRollup // []) as $c |
+        if ($c | length) == 0 then ""
+        elif ($c | any(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED" or .state == "FAILURE" or .state == "ERROR")) then "fail"
+        elif ($c | any(.status == "IN_PROGRESS" or .status == "QUEUED" or .state == "PENDING")) then "pending"
+        else "pass" end
+      )] | @tsv'
+      cd "$REPO_ROOT" || exit
+      for b in "${pr_branches[@]}"; do
+        gh pr list --head "$b" --state all --limit 1 \
+          --json headRefName,number,url,state,statusCheckRollup \
+          --jq "$jq_expr" 2>/dev/null >> "$pr_tmp" || true
+      done
+      mv "$pr_tmp" "$PR_MAP_FILE"
+    ) &
+  fi
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
+  lookup_pr "$main_branch"
+  if [[ -n "$PR_NUM" ]]; then
+    (( max_display += 4 + ${#PR_NUM} ))
+    [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( max_display += 2 ))
+  fi
 
   while IFS=$'\t' read -r _ _ _ wt_label wt_branch; do
     calc_display_len "$wt_label" "$wt_branch"
-    (( REPLY > max_display )) && max_display=$REPLY
+    local wd=$REPLY
+    lookup_pr "$wt_branch"
+    if [[ -n "$PR_NUM" ]]; then
+      (( wd += 4 + ${#PR_NUM} ))
+      [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( wd += 2 ))
+    fi
+    (( wd > max_display )) && max_display=$wd
   done < "$WT_LIST_FILE"
 
   AGE_COL=$(( max_display + 4 ))
@@ -330,6 +409,16 @@ with open('$cache_file', 'w') as out:
     printf "${BOLD}  %s${R}  ${DIM}%s worktrees  %s${R}\n" "$REPO_NAME" "$wt_count" "$time_str"
     local hr_width=$(( AGE_COL - 2 ))
     printf "  ${DIM}%s${R}\n" "$(printf '%*s' "$hr_width" '' | tr ' ' '─')"
+
+    # develop branch sync status (shown regardless of current branch)
+    if git -C "$REPO_ROOT" rev-parse --verify develop &>/dev/null && \
+       git -C "$REPO_ROOT" rev-parse --verify origin/develop &>/dev/null; then
+      local dev_behind
+      dev_behind="$(git -C "$REPO_ROOT" rev-list --count develop..origin/develop 2>/dev/null || echo 0)"
+      if (( dev_behind > 0 )); then
+        printf "  ${YELLOW}develop  ↓ %d${R}\n\n" "$dev_behind"
+      fi
+    fi
 
     # Main repo (always first)
     print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch"
