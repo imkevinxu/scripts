@@ -472,8 +472,6 @@ paint() {
       (( SCROLL_OFFSET > 0 && below <= 0 )) && hint="↑ ${SCROLL_OFFSET}"
       (( SCROLL_OFFSET == 0 && below > 0 )) && hint="↓ ${below} more"
       printf '%s%s  %s  %s  j/k g/G%s\n' "$CLR_EOL" "$DIM" "$ri" "$hint" "$R"
-    else
-      printf '%s%s  %s  %ds  r=refresh  q=quit%s\n' "$CLR_EOL" "$DIM" "$ri" "$INTERVAL" "$R"
     fi
   fi
   printf '\033[J'
