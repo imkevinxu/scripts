@@ -218,8 +218,10 @@ render_to_file() {
 
   # Background fetch (throttled to every 30s)
   local fetch_stamp="$REPO_ROOT/.git/trees-fetch-ts"
-  local last_fetch
-  IFS= read -r last_fetch < "$fetch_stamp" 2>/dev/null || last_fetch=0
+  local last_fetch=0
+  if [[ -f "$fetch_stamp" ]]; then
+    IFS= read -r last_fetch < "$fetch_stamp" 2>/dev/null || true
+  fi
   if (( NOW_TS - last_fetch > 30 )); then
     wait 2>/dev/null || true
     git -C "$REPO_ROOT" fetch --quiet 2>/dev/null &
