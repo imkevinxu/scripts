@@ -488,7 +488,9 @@ with open('$cache_file', 'w') as out:
     echo  # blank row — some terminals hide row 1 in alt screen
     local time_str
     time_str="$(date '+%I:%M:%S %p')"; time_str="${time_str#0}"
-    printf "${BOLD}  %s${R}  ${DIM}%s worktrees  %s${R}\n" "$REPO_NAME" "$wt_count" "$time_str"
+    printf "${BOLD}  %s${R}  ${DIM}%s worktrees" "$REPO_NAME" "$wt_count"
+    (( orphan_count > 0 )) && printf "  %d PR%s" "$orphan_count" "$( (( orphan_count != 1 )) && echo 's' || true)"
+    printf "  %s${R}\n" "$time_str"
     local hr_width=$(( AGE_COL - 2 ))
     printf "  ${DIM}%s${R}\n" "$(printf '%*s' "$hr_width" '' | tr ' ' '─')"
 
