@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# Live git worktree status dashboard — run from any git repo
+# Usage: git-trees [refresh_seconds]
+#   Defaults to 5s refresh. Pass 0 for single run.
+
+set -euo pipefail
+
+INTERVAL="${1:-5}"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "Not a git repository." >&2; exit 1
+}
+REPO_NAME="$(basename "$REPO_ROOT")"
+
+# Colors — $'...' so variables contain raw ESC bytes
+R=$'\033[0m'
+DIM=$'\033[2m'
+BOLD=$'\033[1m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+CYAN=$'\033[36m'
+MAGENTA=$'\033[35m'
+BLUE=$'\033[34m'
+CLAUDE_ORANGE=$'\033[38;2;217;119;87m'
+SESSION_ICON="󱚦"
+CODEX_DIR="$HOME/.codex"
+CLR_EOL=$'\033[K'
+MAX_CODEX_LABEL=35
+
+# Session heartbeat dir (written by starship-claude status line)
+HEARTBEAT_DIR="$HOME/.claude/session-heartbeats"
+
+# Persistent temp files (reused across render cycles — no leak)
+CLAUDE_SESSION_MAP="$(mktemp)"
+RENDER_FILE="$(mktemp)"
+TMP_ALL="$(mktemp)"
+WT_LIST_FILE="$(mktemp)"
+TMP_FILES=("$CLAUDE_SESSION_MAP" "$RENDER_FILE" "$TMP_ALL" "$WT_LIST_FILE")
+
+# Shared state — set once per render cycle in render_to_file()
+NOW_TS=0
+AGE_COL=0
+
+# Sets REPLY instead of echoing — avoids subshell fork at call sites
+format_age() {
+  local s="$1"
+  if (( s < 60 )); then REPLY="now"
+  elif (( s < 3600 )); then REPLY="$(( s / 60 ))m"
+  elif (( s < 86400 )); then REPLY="$(( s / 3600 ))h"
+  else REPLY="$(( s / 86400 ))d"
+  fi
+}
+
+scan_claude_sessions() {
+  > "$CLAUDE_SESSION_MAP"
+  [[ -d "$HEARTBEAT_DIR" ]] || return
+
+  > "$TMP_ALL"
+
+  for f in "$HEARTBEAT_DIR"/*; do
+    [[ -f "$f" ]] || continue
+    local hb_line
+    IFS= read -r hb_line < "$f" 2>/dev/null || continue
+    [[ -n "$hb_line" ]] || continue
+
+    # Field 1 and 2 are always non-empty — safe to extract with bash
+    local hb_repo="${hb_line%%$'\t'*}"
+    [[ "$hb_repo" == "$REPO_ROOT" ]] || continue
+    local hb_rest="${hb_line#*$'\t'}"
+    local hb_wt="${hb_rest%%$'\t'*}"
+    # Field 5 (ts) — use cut because bash 3.2 IFS read collapses empty middle fields
+    local hb_ts
+    hb_ts="$(printf '%s' "$hb_line" | cut -f5)"
+
+    local sid="${f##*/}"
+    local alive=0
+    (( NOW_TS - ${hb_ts:-0} < 28800 )) && alive=1
+
+    printf '%s\t%s\t%s\t%s\n' "$hb_wt" "${hb_ts:-0}" "$sid" "$alive" >> "$TMP_ALL"
+  done
+
+  [[ -s "$TMP_ALL" ]] && sort -t$'\t' -k1,1 -k2,2rn "$TMP_ALL" > "$CLAUDE_SESSION_MAP"
+}
+
+get_claude_sessions() {
+  local key="$1"
+  [[ -s "$CLAUDE_SESSION_MAP" ]] || return
+  grep "^${key}	" "$CLAUDE_SESSION_MAP" 2>/dev/null || true
+}
+
+print_status() {
+  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6"
+
+  # Ahead/behind tracking branch
+  local ahead=0 behind=0 upstream
+  upstream="$(git -C "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+  if [[ -n "$upstream" ]]; then
+    local ab
+    ab="$(git -C "$dir" rev-list --left-right --count HEAD..."$upstream" 2>/dev/null || echo "0	0")"
+    IFS=$'\t' read -r ahead behind <<< "$ab"
+  fi
+
+  # File counts (two case passes — bash 3.2 has no ;;&)
+  local staged=0 modified=0 untracked=0 status_output
+  status_output="$(git -C "$dir" status --porcelain 2>/dev/null || true)"
+  if [[ -n "$status_output" ]]; then
+    while IFS= read -r sline; do
+      case "${sline:0:2}" in
+        '??') (( untracked++ )); continue ;;
+      esac
+      case "${sline:0:1}" in
+        [MADRC]) (( staged++ )) ;;
+      esac
+      case "${sline:1:1}" in
+        [MD]) (( modified++ )) ;;
+      esac
+    done <<< "$status_output"
+  fi
+
+  # Last commit age
+  local age_str=""
+  if (( commit_ts > 0 )); then
+    format_age $(( NOW_TS - commit_ts )); age_str="$REPLY"
+  fi
+
+  # Build display name and compute padding
+  local name_color="$CYAN"
+  [[ "$wt_type" == "main" ]] && name_color="$MAGENTA"
+  [[ "$wt_type" == "codex" ]] && name_color="$BLUE"
+
+  local show_branch="" display_len
+  [[ "$branch" != "$label" ]] && show_branch=1
+  if [[ -n "$show_branch" ]]; then
+    display_len=$(( ${#label} + 4 + ${#branch} ))
+  else
+    display_len=${#label}
+  fi
+  local pad=$(( AGE_COL - 2 - display_len ))
+  (( pad < 2 )) && pad=2
+
+  printf "  "
+  if [[ -n "$show_branch" ]]; then
+    printf "${name_color}${BOLD}%s${R} ${DIM}on${R} ${BOLD}%s${R}" "$label" "$branch"
+  else
+    printf "${name_color}${BOLD}%s${R}" "$label"
+  fi
+  printf "%-${pad}s" ""
+  [[ -n "$age_str" ]] && printf "${DIM}%3s${R}" "$age_str"
+
+  # Codex indicator
+  [[ "$wt_type" == "codex" ]] && printf "\n    ${BLUE}${SESSION_ICON}  codex${R}"
+
+  # Claude session indicators (skip for main repo — sessions pile up and never clean up)
+  if [[ "$wt_type" != "main" ]]; then
+    local session_lines
+    session_lines="$(get_claude_sessions "$session_key")"
+    if [[ -n "$session_lines" ]]; then
+      while IFS= read -r session_line; do
+        [[ -n "$session_line" ]] || continue
+        local s_wt s_mtime s_id s_alive
+        IFS=$'\t' read -r s_wt s_mtime s_id s_alive <<< "$session_line"
+        format_age $(( NOW_TS - s_mtime )); local s_age="$REPLY"
+        local s_pad=$(( AGE_COL - 4 - 1 - 2 - ${#s_id} ))
+        (( s_pad < 2 )) && s_pad=2
+        if (( s_alive )); then
+          printf "\n    ${CLAUDE_ORANGE}${SESSION_ICON}${R}  ${DIM}%s%*s%3s${R}" "$s_id" "$s_pad" "" "$s_age"
+        else
+          printf "\n    ${DIM}${SESSION_ICON}  %s%*s%3s${R}" "$s_id" "$s_pad" "" "$s_age"
+        fi
+      done <<< "$session_lines"
+    fi
+  fi
+  echo
+
+  # Status badges (only print line if there are any)
+  local badges="" sep=""
+  if [[ -n "$upstream" ]]; then
+    if ! git -C "$dir" rev-parse --verify "refs/remotes/$upstream" &>/dev/null; then
+      badges+="${RED}gone${R}"; sep="  "
+    fi
+  fi
+  (( ahead > 0 )) && { badges+="${sep}${GREEN}↑  ${ahead}${R}"; sep="  "; }
+  (( behind > 0 )) && { badges+="${sep}${RED}↓  ${behind}${R}"; sep="  "; }
+  (( staged > 0 )) && { badges+="${sep}${GREEN}●  ${staged} staged${R}"; sep="  "; }
+  (( modified > 0 )) && { badges+="${sep}${YELLOW}●  ${modified} modified${R}"; sep="  "; }
+  (( untracked > 0 )) && { badges+="${sep}${DIM}+  ${untracked} untracked${R}"; sep="  "; }
+  [[ -n "$badges" ]] && printf "    %b\n" "$badges"
+  echo
+}
+
+render_to_file() {
+  NOW_TS="$(date +%s)"
+
+  # Background fetch (throttled to every 30s)
+  local fetch_stamp="$REPO_ROOT/.git/trees-fetch-ts"
+  local last_fetch=0
+  [[ -f "$fetch_stamp" ]] && last_fetch="$(cat "$fetch_stamp" 2>/dev/null || echo 0)"
+  if (( NOW_TS - last_fetch > 30 )); then
+    wait 2>/dev/null || true
+    git -C "$REPO_ROOT" fetch --quiet 2>/dev/null &
+    echo "$NOW_TS" > "$fetch_stamp" 2>/dev/null || true
+  fi
+
+  scan_claude_sessions
+
+  # Build codex cache before worktree loop (runs at most once per index change)
+  local cache_file="$HOME/.claude/codex-wt-cache"
+  if [[ -f "$CODEX_DIR/session_index.jsonl" ]]; then
+    local idx_mtime cache_mtime
+    idx_mtime="$(stat -f "%m" "$CODEX_DIR/session_index.jsonl" 2>/dev/null || echo 0)"
+    cache_mtime="$(stat -f "%m" "$cache_file" 2>/dev/null || echo 0)"
+    if (( idx_mtime > cache_mtime )); then
+      python3 -c "
+import json, glob, os
+idx = '$CODEX_DIR/session_index.jsonl'
+sdir = '$CODEX_DIR/sessions'
+names = {}
+with open(idx) as f:
+    for l in f:
+        try:
+            d = json.loads(l)
+            names[d['id']] = d.get('thread_name','')
+        except: pass
+files = sorted(glob.glob(os.path.join(sdir, '**/*.jsonl'), recursive=True), key=os.path.getmtime, reverse=True)[:20]
+seen = {}
+for fp in files:
+    try:
+        with open(fp) as sf:
+            p = json.loads(sf.readline()).get('payload', {})
+        cwd = p.get('cwd', '')
+        if '/.codex/worktrees/' not in cwd: continue
+        wt_hash = cwd.split('/worktrees/')[1].split('/')[0]
+        if wt_hash in seen: continue
+        sid = p.get('id', '')
+        seen[wt_hash] = names.get(sid, '')
+    except: continue
+with open('$cache_file', 'w') as out:
+    for h, n in seen.items():
+        out.write(f'{h}\t{n}\n')
+" 2>/dev/null || true
+    fi
+  fi
+
+  # Collect worktrees: commit_ts \t type \t dir \t label \t branch
+  > "$WT_LIST_FILE"
+  local wt_count=0
+
+  while IFS= read -r line; do
+    local wt_dir="${line%% *}"
+    [[ "$wt_dir" == "$REPO_ROOT" ]] && continue
+
+    local wt_ts wt_branch
+    wt_ts="$(git -C "$wt_dir" log -1 --format='%ct' 2>/dev/null || echo 0)"
+    wt_branch="$(git -C "$wt_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
+
+    case "$wt_dir" in
+      "$REPO_ROOT"/*)
+        local wt_label="${wt_dir#"$REPO_ROOT"/.worktrees/}"
+        printf '%s\tlocal\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$wt_label" "$wt_branch" >> "$WT_LIST_FILE"
+        (( wt_count++ ))
+        ;;
+      */.codex/worktrees/*)
+        local codex_hash="${wt_dir##*/worktrees/}"
+        codex_hash="${codex_hash%%/*}"
+        local codex_label
+        codex_label="$(grep "^${codex_hash}	" "$cache_file" 2>/dev/null | cut -f2 || true)"
+        codex_label="${codex_label:-codex:${codex_hash}}"
+        if [[ "$wt_branch" != "HEAD" && "$wt_branch" != "detached" ]]; then
+          codex_label="$wt_branch"
+        fi
+        # Truncate inline — no second pass needed
+        if (( ${#codex_label} > MAX_CODEX_LABEL )); then
+          codex_label="${codex_label:0:$((MAX_CODEX_LABEL - 1))}…"
+        fi
+        printf '%s\tcodex\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$codex_label" "$wt_branch" >> "$WT_LIST_FILE"
+        (( wt_count++ ))
+        ;;
+    esac
+  done < <(git -C "$REPO_ROOT" worktree list)
+
+  sort -t$'\t' -k1,1rn -o "$WT_LIST_FILE" "$WT_LIST_FILE"
+
+  # Compute max display width
+  local main_branch main_commit_ts
+  main_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
+  main_commit_ts="$(git -C "$REPO_ROOT" log -1 --format='%ct' 2>/dev/null || echo 0)"
+  local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
+
+  while IFS=$'\t' read -r _ _ _ wt_label wt_branch; do
+    local dlen
+    if [[ "$wt_branch" != "$wt_label" ]]; then
+      dlen=$(( ${#wt_label} + 4 + ${#wt_branch} ))
+    else
+      dlen=${#wt_label}
+    fi
+    (( dlen > max_display )) && max_display=$dlen
+  done < "$WT_LIST_FILE"
+
+  AGE_COL=$(( max_display + 4 ))
+  (( AGE_COL < 45 )) && AGE_COL=45
+
+  {
+    echo  # blank row — some terminals hide row 1 in alt screen
+    local time_str
+    time_str="$(date '+%I:%M:%S %p')"; time_str="${time_str#0}"
+    printf "${BOLD}  %s${R}  ${DIM}%s worktrees  %s${R}\n" "$REPO_NAME" "$wt_count" "$time_str"
+    local hr_width=$(( AGE_COL - 2 ))
+    printf "  ${DIM}%s${R}\n" "$(printf '─%.0s' $(seq 1 "$hr_width"))"
+
+    # Main repo (always first)
+    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch"
+
+    # Other worktrees sorted by activity
+    while IFS=$'\t' read -r ts wt_type wt_dir wt_label wt_branch; do
+      local session_key
+      if [[ "$wt_type" == "codex" ]]; then
+        session_key="__codex__/${wt_dir##*/}"
+      else
+        session_key="${wt_dir##*/}"
+      fi
+      print_status "$wt_dir" "$wt_label" "$wt_type" "$session_key" "$ts" "$wt_branch"
+    done < "$WT_LIST_FILE"
+
+  } | sed "s/$/$CLR_EOL/" > "$RENDER_FILE"
+  TOTAL_LINES=$(wc -l < "$RENDER_FILE")
+}
+
+SCROLL_OFFSET=0
+TOTAL_LINES=0
+TERM_H=0
+IS_REFRESHING=0
+update_term_h() { TERM_H=$(tput lines); }
+
+paint() {
+  local visible start end
+  if (( TOTAL_LINES <= TERM_H )); then
+    SCROLL_OFFSET=0
+    start=1; end=$TOTAL_LINES
+  else
+    local max_scroll=$(( TOTAL_LINES - TERM_H + 1 ))
+    (( SCROLL_OFFSET > max_scroll )) && SCROLL_OFFSET=$max_scroll
+    (( SCROLL_OFFSET < 0 )) && SCROLL_OFFSET=0
+    start=$(( SCROLL_OFFSET + 1 ))
+    end=$(( SCROLL_OFFSET + TERM_H - 1 ))
+  fi
+
+  printf '\033[1;1H'
+  sed -n "${start},${end}p" "$RENDER_FILE"
+
+  # Dynamic footer
+  if (( INTERVAL > 0 )); then
+    local ri="◇"
+    (( IS_REFRESHING )) && ri="◆"
+    if (( TOTAL_LINES > TERM_H )); then
+      local below=$(( TOTAL_LINES - end ))
+      local hint=""
+      (( SCROLL_OFFSET > 0 && below > 0 )) && hint="↑ ${SCROLL_OFFSET}  ↓ ${below}"
+      (( SCROLL_OFFSET > 0 && below <= 0 )) && hint="↑ ${SCROLL_OFFSET}"
+      (( SCROLL_OFFSET == 0 && below > 0 )) && hint="↓ ${below} more"
+      printf '%s%s  %s  %s  j/k g/G%s\n' "$CLR_EOL" "$DIM" "$ri" "$hint" "$R"
+    else
+      printf '%s%s  %s  %ds  r=refresh  q=quit%s\n' "$CLR_EOL" "$DIM" "$ri" "$INTERVAL" "$R"
+    fi
+  fi
+  printf '\033[J'
+}
+
+# Single run
+if (( INTERVAL == 0 )); then
+  render_to_file
+  cat "$RENDER_FILE"
+  rm -f "${TMP_FILES[@]}"
+  exit 0
+fi
+
+# Live mode
+ORIG_STTY="$(stty -g)"
+cleanup() { stty "$ORIG_STTY" 2>/dev/null; printf '\e[?1000l\e[?1002l\e[?1003l'; tput cnorm; tput rmcup; rm -f "${TMP_FILES[@]}"; exit 0; }
+trap cleanup INT TERM
+
+update_term_h
+render_to_file
+tput smcup
+printf '\033[r\033[H\033[2J'
+tput civis
+printf '\e[?1000l\e[?1002l\e[?1003l'
+stty -echo -icanon min 0 time 0
+paint
+
+RESIZED=0
+trap 'RESIZED=1; update_term_h' WINCH
+
+LAST_RENDER=$SECONDS
+LAST_SCROLL=0
+SCROLL_COOLDOWN=2
+while true; do
+  # Time-based full render — deferred while user is scrolling
+  if (( RESIZED || SECONDS - LAST_RENDER >= INTERVAL )) && (( SECONDS - LAST_SCROLL >= SCROLL_COOLDOWN )); then
+    RESIZED=0
+    IS_REFRESHING=1; paint
+    render_to_file
+    IS_REFRESHING=0; paint
+    LAST_RENDER=$SECONDS
+  fi
+
+  if read -rsn1 -t 1 key 2>/dev/null; then
+    [[ "$key" == "q" || "$key" == "Q" ]] && break
+    [[ "$key" == "r" || "$key" == "R" ]] && { LAST_RENDER=0; continue; }
+    # Decode arrow keys: ESC [ A/B
+    if [[ "$key" == $'\033' ]]; then
+      b1=""; b2=""
+      read -rsn1 -t 1 b1 2>/dev/null || true
+      if [[ "$b1" == "[" ]]; then
+        read -rsn1 -t 1 b2 2>/dev/null || true
+        case "$b2" in
+          A) key="J" ;;  # up arrow → scroll up
+          B) key="K" ;;  # down arrow → scroll down
+          *) key="" ;;
+        esac
+      else
+        key=""
+      fi
+    fi
+    if [[ "$key" == "k" || "$key" == "K" || "$key" == "j" || "$key" == "J" ]]; then
+      delta=0
+      [[ "$key" == "j" || "$key" == "J" ]] && (( delta-- ))
+      [[ "$key" == "k" || "$key" == "K" ]] && (( delta++ ))
+      while read -rsn1 -t 0 extra 2>/dev/null; do
+        case "$extra" in
+          j|J) (( delta-- )) ;;
+          k|K) (( delta++ )) ;;
+          $'\033') b1=""; b2=""; read -rsn1 -t 0 b1 2>/dev/null || true
+            if [[ "$b1" == "[" ]]; then read -rsn1 -t 0 b2 2>/dev/null || true
+              case "$b2" in A) (( delta-- )) ;; B) (( delta++ )) ;; esac
+            fi ;;
+        esac
+      done
+      (( SCROLL_OFFSET += delta ))
+      LAST_SCROLL=$SECONDS; paint
+    fi
+    [[ "$key" == "g" ]] && { SCROLL_OFFSET=0; LAST_SCROLL=$SECONDS; paint; }
+    [[ "$key" == "G" ]] && { SCROLL_OFFSET=999999; LAST_SCROLL=$SECONDS; paint; }
+  fi
+done
+
+cleanup
