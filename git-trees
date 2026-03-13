@@ -137,7 +137,7 @@ decode_arrow() {
 }
 
 print_status() {
-  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6"
+  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6" dev_behind="${7:-0}"
 
   # Ahead/behind tracking branch
   local ahead=0 behind=0 upstream
@@ -187,6 +187,9 @@ print_status() {
     (( display_len += 4 + ${#PR_NUM} ))
     [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( display_len += 2 ))
   fi
+  if (( dev_behind > 0 )); then
+    (( display_len += 12 + ${#dev_behind} ))
+  fi
 
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
@@ -208,6 +211,9 @@ print_status() {
         pending) printf " ${YELLOW}○${R}" ;;
       esac
     fi
+  fi
+  if (( dev_behind > 0 )); then
+    printf "  ${YELLOW}develop ↓ %d${R}" "$dev_behind"
   fi
   printf "%-${pad}s" ""
   [[ -n "$age_str" ]] && printf "${DIM}%3s${R}" "$age_str"
@@ -455,11 +461,21 @@ with open('$cache_file', 'w') as out:
     (( orphan_count > 0 )) && sort -t$'\t' -k1,1rn -o "$ORPHAN_PR_FILE" "$ORPHAN_PR_FILE"
   fi
 
+  # develop branch sync status (computed here for inline display on main repo line)
+  local dev_behind=0
+  if git -C "$REPO_ROOT" rev-parse --verify develop &>/dev/null && \
+     git -C "$REPO_ROOT" rev-parse --verify origin/develop &>/dev/null; then
+    dev_behind="$(git -C "$REPO_ROOT" rev-list --count develop..origin/develop 2>/dev/null || echo 0)"
+  fi
+
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
   lookup_pr "$main_branch"
   if [[ -n "$PR_NUM" ]]; then
     (( max_display += 4 + ${#PR_NUM} ))
     [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( max_display += 2 ))
+  fi
+  if (( dev_behind > 0 )); then
+    (( max_display += 12 + ${#dev_behind} ))
   fi
 
   while IFS=$'\t' read -r _ _ _ wt_label wt_branch; do
@@ -494,18 +510,8 @@ with open('$cache_file', 'w') as out:
     local hr_width=$(( AGE_COL - 2 ))
     printf "  ${DIM}%s${R}\n" "$(printf '%*s' "$hr_width" '' | tr ' ' '─')"
 
-    # develop branch sync status (shown regardless of current branch)
-    if git -C "$REPO_ROOT" rev-parse --verify develop &>/dev/null && \
-       git -C "$REPO_ROOT" rev-parse --verify origin/develop &>/dev/null; then
-      local dev_behind
-      dev_behind="$(git -C "$REPO_ROOT" rev-list --count develop..origin/develop 2>/dev/null || echo 0)"
-      if (( dev_behind > 0 )); then
-        printf "  ${YELLOW}develop  ↓ %d${R}\n\n" "$dev_behind"
-      fi
-    fi
-
     # Main repo (always first)
-    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch"
+    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch" "$dev_behind"
 
     # Other worktrees sorted by activity
     while IFS=$'\t' read -r ts wt_type wt_dir wt_label wt_branch; do
