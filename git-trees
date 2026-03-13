@@ -354,7 +354,7 @@ SCROLL_OFFSET=0
 TOTAL_LINES=0
 TERM_H=0
 IS_REFRESHING=0
-update_term_h() { TERM_H=$(tput lines); (( TERM_H < 3 )) && TERM_H=3; }
+update_term_h() { TERM_H=$(tput lines); (( TERM_H < 3 )) && TERM_H=3 || true; }
 
 paint() {
   local visible start end
