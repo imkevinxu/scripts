@@ -26,6 +26,7 @@ SESSION_ICON="󱚦"
 CODEX_DIR="$HOME/.codex"
 CLR_EOL=$'\033[K'
 MAX_CODEX_LABEL=35
+SESSION_ALIVE_SECS=28800  # 8 hours
 
 # Session heartbeat dir (written by starship-claude status line)
 HEARTBEAT_DIR="$HOME/.claude/session-heartbeats"
@@ -68,13 +69,15 @@ scan_claude_sessions() {
     [[ "$hb_repo" == "$REPO_ROOT" ]] || continue
     local hb_rest="${hb_line#*$'\t'}"
     local hb_wt="${hb_rest%%$'\t'*}"
-    # Field 5 (ts) — use cut because bash 3.2 IFS read collapses empty middle fields
-    local hb_ts
-    hb_ts="$(printf '%s' "$hb_line" | cut -f5)"
+    # Field 5 (ts) — extract with param expansion (avoids fork)
+    local hb_ts="$hb_line"
+    hb_ts="${hb_ts#*$'\t'}"; hb_ts="${hb_ts#*$'\t'}"
+    hb_ts="${hb_ts#*$'\t'}"; hb_ts="${hb_ts#*$'\t'}"
+    hb_ts="${hb_ts%%$'\t'*}"
 
     local sid="${f##*/}"
     local alive=0
-    (( NOW_TS - ${hb_ts:-0} < 28800 )) && alive=1
+    (( NOW_TS - ${hb_ts:-0} < SESSION_ALIVE_SECS )) && alive=1
 
     printf '%s\t%s\t%s\t%s\n' "$hb_wt" "${hb_ts:-0}" "$sid" "$alive" >> "$TMP_ALL"
   done
@@ -86,6 +89,31 @@ get_claude_sessions() {
   local key="$1"
   [[ -s "$CLAUDE_SESSION_MAP" ]] || return
   grep "^${key}	" "$CLAUDE_SESSION_MAP" 2>/dev/null || true
+}
+
+# Sets REPLY to display length of label [+ " on " + branch]
+calc_display_len() {
+  if [[ "$2" != "$1" ]]; then
+    REPLY=$(( ${#1} + 4 + ${#2} ))
+  else
+    REPLY=${#1}
+  fi
+}
+
+# Reads ESC [ X sequence, sets REPLY to mapped key or ""
+decode_arrow() {
+  local b1="" b2=""
+  read -rsn1 -t "${1:-1}" b1 2>/dev/null || true
+  if [[ "$b1" == "[" ]]; then
+    read -rsn1 -t "${1:-1}" b2 2>/dev/null || true
+    case "$b2" in
+      A) REPLY="J" ;;  # up arrow → scroll up
+      B) REPLY="K" ;;  # down arrow → scroll down
+      *) REPLY="" ;;
+    esac
+  else
+    REPLY=""
+  fi
 }
 
 print_status() {
@@ -128,18 +156,15 @@ print_status() {
   [[ "$wt_type" == "main" ]] && name_color="$MAGENTA"
   [[ "$wt_type" == "codex" ]] && name_color="$BLUE"
 
-  local show_branch="" display_len
+  local show_branch=0
   [[ "$branch" != "$label" ]] && show_branch=1
-  if [[ -n "$show_branch" ]]; then
-    display_len=$(( ${#label} + 4 + ${#branch} ))
-  else
-    display_len=${#label}
-  fi
+  calc_display_len "$label" "$branch"
+  local display_len=$REPLY
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
 
   printf "  "
-  if [[ -n "$show_branch" ]]; then
+  if (( show_branch )); then
     printf "${name_color}${BOLD}%s${R} ${DIM}on${R} ${BOLD}%s${R}" "$label" "$branch"
   else
     printf "${name_color}${BOLD}%s${R}" "$label"
@@ -157,8 +182,8 @@ print_status() {
     if [[ -n "$session_lines" ]]; then
       while IFS= read -r session_line; do
         [[ -n "$session_line" ]] || continue
-        local s_wt s_mtime s_id s_alive
-        IFS=$'\t' read -r s_wt s_mtime s_id s_alive <<< "$session_line"
+        local s_mtime s_id s_alive
+        IFS=$'\t' read -r _ s_mtime s_id s_alive <<< "$session_line"
         format_age $(( NOW_TS - s_mtime )); local s_age="$REPLY"
         local s_pad=$(( AGE_COL - 4 - 1 - 2 - ${#s_id} ))
         (( s_pad < 2 )) && s_pad=2
@@ -193,8 +218,8 @@ render_to_file() {
 
   # Background fetch (throttled to every 30s)
   local fetch_stamp="$REPO_ROOT/.git/trees-fetch-ts"
-  local last_fetch=0
-  [[ -f "$fetch_stamp" ]] && last_fetch="$(cat "$fetch_stamp" 2>/dev/null || echo 0)"
+  local last_fetch
+  IFS= read -r last_fetch < "$fetch_stamp" 2>/dev/null || last_fetch=0
   if (( NOW_TS - last_fetch > 30 )); then
     wait 2>/dev/null || true
     git -C "$REPO_ROOT" fetch --quiet 2>/dev/null &
@@ -287,13 +312,8 @@ with open('$cache_file', 'w') as out:
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
 
   while IFS=$'\t' read -r _ _ _ wt_label wt_branch; do
-    local dlen
-    if [[ "$wt_branch" != "$wt_label" ]]; then
-      dlen=$(( ${#wt_label} + 4 + ${#wt_branch} ))
-    else
-      dlen=${#wt_label}
-    fi
-    (( dlen > max_display )) && max_display=$dlen
+    calc_display_len "$wt_label" "$wt_branch"
+    (( REPLY > max_display )) && max_display=$REPLY
   done < "$WT_LIST_FILE"
 
   AGE_COL=$(( max_display + 4 ))
@@ -305,7 +325,7 @@ with open('$cache_file', 'w') as out:
     time_str="$(date '+%I:%M:%S %p')"; time_str="${time_str#0}"
     printf "${BOLD}  %s${R}  ${DIM}%s worktrees  %s${R}\n" "$REPO_NAME" "$wt_count" "$time_str"
     local hr_width=$(( AGE_COL - 2 ))
-    printf "  ${DIM}%s${R}\n" "$(printf '─%.0s' $(seq 1 "$hr_width"))"
+    printf "  ${DIM}%s${R}\n" "$(printf '%*s' "$hr_width" '' | tr ' ' '─')"
 
     # Main repo (always first)
     print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch"
@@ -322,14 +342,15 @@ with open('$cache_file', 'w') as out:
     done < "$WT_LIST_FILE"
 
   } | sed "s/$/$CLR_EOL/" > "$RENDER_FILE"
-  TOTAL_LINES=$(wc -l < "$RENDER_FILE")
+  TOTAL_LINES=0
+  while IFS= read -r _; do (( TOTAL_LINES++ )); done < "$RENDER_FILE"
 }
 
 SCROLL_OFFSET=0
 TOTAL_LINES=0
 TERM_H=0
 IS_REFRESHING=0
-update_term_h() { TERM_H=$(tput lines); }
+update_term_h() { TERM_H=$(tput lines); (( TERM_H < 3 )) && TERM_H=3; }
 
 paint() {
   local visible start end
@@ -388,13 +409,18 @@ stty -echo -icanon min 0 time 0
 paint
 
 RESIZED=0
-trap 'RESIZED=1; update_term_h' WINCH
+# Only set flag in WINCH handler — never fork (tput) inside a signal handler.
+# Forking during rapid resizes causes subprocess pileup → SIGKILL.
+trap 'RESIZED=1' WINCH
 
 LAST_RENDER=$SECONDS
 LAST_SCROLL=0
 SCROLL_COOLDOWN=2
 while true; do
   # Time-based full render — deferred while user is scrolling
+  if (( RESIZED )); then
+    update_term_h
+  fi
   if (( RESIZED || SECONDS - LAST_RENDER >= INTERVAL )) && (( SECONDS - LAST_SCROLL >= SCROLL_COOLDOWN )); then
     RESIZED=0
     IS_REFRESHING=1; paint
@@ -408,18 +434,7 @@ while true; do
     [[ "$key" == "r" || "$key" == "R" ]] && { LAST_RENDER=0; continue; }
     # Decode arrow keys: ESC [ A/B
     if [[ "$key" == $'\033' ]]; then
-      b1=""; b2=""
-      read -rsn1 -t 1 b1 2>/dev/null || true
-      if [[ "$b1" == "[" ]]; then
-        read -rsn1 -t 1 b2 2>/dev/null || true
-        case "$b2" in
-          A) key="J" ;;  # up arrow → scroll up
-          B) key="K" ;;  # down arrow → scroll down
-          *) key="" ;;
-        esac
-      else
-        key=""
-      fi
+      decode_arrow 1; key="$REPLY"
     fi
     if [[ "$key" == "k" || "$key" == "K" || "$key" == "j" || "$key" == "J" ]]; then
       delta=0
@@ -429,17 +444,15 @@ while true; do
         case "$extra" in
           j|J) (( delta-- )) ;;
           k|K) (( delta++ )) ;;
-          $'\033') b1=""; b2=""; read -rsn1 -t 0 b1 2>/dev/null || true
-            if [[ "$b1" == "[" ]]; then read -rsn1 -t 0 b2 2>/dev/null || true
-              case "$b2" in A) (( delta-- )) ;; B) (( delta++ )) ;; esac
-            fi ;;
+          $'\033') decode_arrow 0
+            case "$REPLY" in J) (( delta-- )) ;; K) (( delta++ )) ;; esac ;;
         esac
       done
       (( SCROLL_OFFSET += delta ))
       LAST_SCROLL=$SECONDS; paint
     fi
     [[ "$key" == "g" ]] && { SCROLL_OFFSET=0; LAST_SCROLL=$SECONDS; paint; }
-    [[ "$key" == "G" ]] && { SCROLL_OFFSET=999999; LAST_SCROLL=$SECONDS; paint; }
+    [[ "$key" == "G" ]] && { SCROLL_OFFSET=$TOTAL_LINES; LAST_SCROLL=$SECONDS; paint; }
   fi
 done
 
