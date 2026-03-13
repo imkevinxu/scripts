@@ -36,13 +36,15 @@ CLAUDE_SESSION_MAP="$(mktemp)"
 RENDER_FILE="$(mktemp)"
 TMP_ALL="$(mktemp)"
 WT_LIST_FILE="$(mktemp)"
-TMP_FILES=("$CLAUDE_SESSION_MAP" "$RENDER_FILE" "$TMP_ALL" "$WT_LIST_FILE")
+ORPHAN_PR_FILE="$(mktemp)"
+TMP_FILES=("$CLAUDE_SESSION_MAP" "$RENDER_FILE" "$TMP_ALL" "$WT_LIST_FILE" "$ORPHAN_PR_FILE")
 
 # Shared state — set once per render cycle in render_to_file()
 NOW_TS=0
 AGE_COL=0
 FETCH_PID=""
 PR_MAP_FILE="$REPO_ROOT/.git/trees-pr-cache"
+MY_PR_FILE="$REPO_ROOT/.git/trees-my-prs"
 PR_NUM=""
 PR_URL=""
 PR_STATE=""
@@ -251,6 +253,44 @@ print_status() {
   echo
 }
 
+print_orphan_pr() {
+  local branch="$1" pr_num="$2" pr_url="$3" pr_state="$4" pr_ci="$5" commit_ts="$6" is_draft="$7"
+
+  local age_str=""
+  if (( commit_ts > 0 )); then
+    format_age $(( NOW_TS - commit_ts )); age_str="$REPLY"
+  fi
+
+  local display_len=${#branch}
+  (( display_len += 4 + ${#pr_num} ))
+  [[ -n "$is_draft" ]] && (( display_len += 6 ))
+  [[ -n "$pr_ci" || "$pr_state" == "MERGED" ]] && (( display_len += 2 ))
+
+  local pad=$(( AGE_COL - 2 - display_len ))
+  (( pad < 2 )) && pad=2
+
+  if [[ -n "$is_draft" ]]; then
+    printf "  ${DIM}%s${R}" "$branch"
+  else
+    printf "  ${BOLD}%s${R}" "$branch"
+  fi
+  printf ' \033]8;;%s\007%s(#%s)%s\033]8;;\007' "$pr_url" "$DIM" "$pr_num" "$R"
+  [[ -n "$is_draft" ]] && printf " ${DIM}draft${R}"
+  if [[ "$pr_state" == "MERGED" ]]; then
+    printf " ${MAGENTA}●${R}"
+  else
+    case "$pr_ci" in
+      pass)    printf " ${GREEN}✓${R}" ;;
+      fail)    printf " ${RED}✗${R}" ;;
+      pending) printf " ${YELLOW}○${R}" ;;
+    esac
+  fi
+  printf "%-${pad}s" ""
+  [[ -n "$age_str" ]] && printf "${DIM}%3s${R}" "$age_str"
+  echo
+  echo
+}
+
 render_to_file() {
   NOW_TS="$(date +%s)"
 
@@ -379,8 +419,42 @@ with open('$cache_file', 'w') as out:
           --jq "$jq_expr" 2>/dev/null >> "$pr_tmp" || true
       done
       mv "$pr_tmp" "$PR_MAP_FILE"
+      # Fetch all my open PRs (includes isDraft)
+      local my_tmp; my_tmp="$(mktemp)"
+      local my_jq='.[] | [.headRefName, (.number | tostring), .url, .state, (
+        (.statusCheckRollup // []) as $c |
+        if ($c | length) == 0 then ""
+        elif ($c | any(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED" or .state == "FAILURE" or .state == "ERROR")) then "fail"
+        elif ($c | any(.status == "IN_PROGRESS" or .status == "QUEUED" or .state == "PENDING")) then "pending"
+        else "pass" end
+      ), (if .isDraft then "draft" else "" end)] | @tsv'
+      gh pr list --author @me --state open \
+        --json headRefName,number,url,state,statusCheckRollup,isDraft \
+        --jq "$my_jq" 2>/dev/null > "$my_tmp" || true
+      mv "$my_tmp" "$MY_PR_FILE"
     ) &
   fi
+
+  # Build orphan PR list (open PRs without a local worktree)
+  > "$ORPHAN_PR_FILE"
+  local orphan_count=0
+  if [[ -s "$MY_PR_FILE" ]]; then
+    local wt_branches_list="$main_branch"
+    while IFS=$'\t' read -r _ _ _ _ wb; do
+      wt_branches_list+=$'\n'"$wb"
+    done < "$WT_LIST_FILE"
+    while IFS=$'\t' read -r op_branch op_num op_url op_state op_ci op_draft; do
+      if printf '%s\n' "$wt_branches_list" | grep -qxF "$op_branch" 2>/dev/null; then
+        continue
+      fi
+      local op_ts
+      op_ts="$(git -C "$REPO_ROOT" log -1 --format='%ct' "origin/$op_branch" 2>/dev/null || echo 0)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$op_ts" "$op_branch" "$op_num" "$op_url" "$op_state" "$op_ci" "$op_draft" >> "$ORPHAN_PR_FILE"
+      (( orphan_count++ ))
+    done < "$MY_PR_FILE"
+    (( orphan_count > 0 )) && sort -t$'\t' -k1,1rn -o "$ORPHAN_PR_FILE" "$ORPHAN_PR_FILE"
+  fi
+
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
   lookup_pr "$main_branch"
   if [[ -n "$PR_NUM" ]]; then
@@ -398,6 +472,14 @@ with open('$cache_file', 'w') as out:
     fi
     (( wd > max_display )) && max_display=$wd
   done < "$WT_LIST_FILE"
+
+  while IFS=$'\t' read -r _ op_branch op_num _ op_state op_ci op_draft; do
+    local wd=${#op_branch}
+    (( wd += 4 + ${#op_num} ))
+    [[ -n "$op_draft" ]] && (( wd += 6 ))
+    [[ -n "$op_ci" || "$op_state" == "MERGED" ]] && (( wd += 2 ))
+    (( wd > max_display )) && max_display=$wd
+  done < "$ORPHAN_PR_FILE"
 
   AGE_COL=$(( max_display + 4 ))
   (( AGE_COL < 45 )) && AGE_COL=45
@@ -433,6 +515,13 @@ with open('$cache_file', 'w') as out:
       fi
       print_status "$wt_dir" "$wt_label" "$wt_type" "$session_key" "$ts" "$wt_branch"
     done < "$WT_LIST_FILE"
+
+    # Orphan PRs (open, authored by me, no local worktree)
+    if (( orphan_count > 0 )); then
+      while IFS=$'\t' read -r op_ts op_branch op_num op_url op_state op_ci op_draft; do
+        print_orphan_pr "$op_branch" "$op_num" "$op_url" "$op_state" "$op_ci" "$op_ts" "$op_draft"
+      done < "$ORPHAN_PR_FILE"
+    fi
 
   } | sed "s/$/$CLR_EOL/" > "$RENDER_FILE"
   TOTAL_LINES=0
