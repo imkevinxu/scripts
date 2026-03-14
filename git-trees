@@ -113,7 +113,7 @@ get_claude_sessions() {
 
 # Sets REPLY to display length of label [+ " on " + branch]
 calc_display_len() {
-  if [[ "$2" != "$1" ]]; then
+  if [[ "${2##*/}" != "$1" ]]; then
     REPLY=$(( ${#1} + 4 + ${#2} ))
   else
     REPLY=${#1}
@@ -177,7 +177,7 @@ print_status() {
   [[ "$wt_type" == "codex" ]] && name_color="$BLUE"
 
   local show_branch=0
-  [[ "$branch" != "$label" ]] && show_branch=1
+  [[ "${branch##*/}" != "$label" ]] && show_branch=1
   calc_display_len "$label" "$branch"
   local display_len=$REPLY
 
@@ -368,6 +368,8 @@ with open('$cache_file', 'w') as out:
     case "$wt_dir" in
       "$REPO_ROOT"/*)
         local wt_label="${wt_dir#"$REPO_ROOT"/.worktrees/}"
+        # If label matches branch (e.g. kevin/foo dir → kevin/foo label), use basename
+        [[ "$wt_label" == "$wt_branch" ]] && wt_label="${wt_branch##*/}"
         printf '%s\tlocal\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$wt_label" "$wt_branch" >> "$WT_LIST_FILE"
         (( wt_count++ ))
         ;;
@@ -378,7 +380,7 @@ with open('$cache_file', 'w') as out:
         codex_label="$(grep "^${codex_hash}	" "$cache_file" 2>/dev/null | cut -f2 || true)"
         codex_label="${codex_label:-codex:${codex_hash}}"
         if [[ "$wt_branch" != "HEAD" && "$wt_branch" != "detached" ]]; then
-          codex_label="$wt_branch"
+          codex_label="${wt_branch##*/}"
         fi
         # Truncate inline — no second pass needed
         if (( ${#codex_label} > MAX_CODEX_LABEL )); then
