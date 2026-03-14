@@ -234,12 +234,21 @@ if command -v jq >/dev/null 2>&1 && [ -n "$payload" ]; then
       [ -n "$_hb_check_dir" ] || continue
       if echo "$_hb_check_dir" | grep -q '\.worktrees/'; then
         _hb_repo="$(echo "$_hb_check_dir" | sed 's|/\.worktrees/.*||')"
+        # Find the longest matching worktree path (main repo is a prefix of all)
+        _hb_best="" _hb_best_len=0
         while IFS= read -r _wt_line; do
           _wt_dir="$(echo "$_wt_line" | awk '{print $1}')"
           case "$_hb_check_dir" in
-            "$_wt_dir"*) _hb_wt_detected="$(basename "$_wt_dir")"; break 2 ;;
+            "$_wt_dir"|"$_wt_dir"/*)
+              if [ ${#_wt_dir} -gt "$_hb_best_len" ]; then
+                _hb_best="$_wt_dir"; _hb_best_len=${#_wt_dir}
+              fi ;;
           esac
         done < <(git -C "$_hb_repo" worktree list 2>/dev/null)
+        if [ -n "$_hb_best" ] && echo "$_hb_best" | grep -q '\.worktrees/'; then
+          _hb_wt_detected="$(basename "$_hb_best")"
+          break
+        fi
       fi
     done
     _hb_wt_name="${_hb_wt_detected}"
