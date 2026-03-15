@@ -393,6 +393,8 @@ with open('$cache_file', 'w') as out:
         (( wt_count++ ))
         ;;
       */.codex/worktrees/*)
+        # Hide codex worktrees still on develop (no meaningful work)
+        [[ "$wt_branch" == "develop" ]] && continue
         local codex_hash="${wt_dir##*/worktrees/}"
         codex_hash="${codex_hash%%/*}"
         local codex_label
@@ -490,19 +492,35 @@ with open('$cache_file', 'w') as out:
     dev_behind="$(git -C "$REPO_ROOT" rev-list --count HEAD..origin/develop 2>/dev/null || echo 0)"
   fi
 
-  # Detect if main repo HEAD matches a worktree branch (synced commits)
-  # Compare tree SHAs — handles cherry-picks where commit SHAs differ but content is identical
-  local main_tree_sha matched_branch=""
-  main_tree_sha="$(git -C "$REPO_ROOT" rev-parse HEAD^{tree} 2>/dev/null || true)"
-  if [[ -n "$main_tree_sha" ]]; then
-    while IFS=$'\t' read -r _ _ _ _ wt_branch _; do
-      local wt_tree
-      wt_tree="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$wt_branch^{tree}" 2>/dev/null || true)"
-      if [[ "$main_tree_sha" == "$wt_tree" ]]; then
-        matched_branch="$wt_branch"
-        break
+  # Detect if main repo HEAD is synced from a worktree branch
+  local matched_branch=""
+  if [[ -s "$WT_LIST_FILE" ]]; then
+    # Fast path: exact tree SHA match (branch tip has identical file state)
+    local main_tree_sha
+    main_tree_sha="$(git -C "$REPO_ROOT" rev-parse HEAD^{tree} 2>/dev/null || true)"
+    if [[ -n "$main_tree_sha" ]]; then
+      while IFS=$'\t' read -r _ _ _ _ wt_branch _; do
+        local wt_tree
+        wt_tree="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$wt_branch^{tree}" 2>/dev/null || true)"
+        if [[ "$main_tree_sha" == "$wt_tree" ]]; then
+          matched_branch="$wt_branch"
+          break
+        fi
+      done < "$WT_LIST_FILE"
+    fi
+    # Fallback: latest commit message match (branch moved ahead after sync)
+    if [[ -z "$matched_branch" ]] && (( HAS_ORIGIN_DEV )); then
+      local main_latest_msg
+      main_latest_msg="$(git -C "$REPO_ROOT" log -1 --format='%s' origin/develop..HEAD 2>/dev/null || true)"
+      if [[ -n "$main_latest_msg" ]]; then
+        while IFS=$'\t' read -r _ _ _ _ wt_branch _; do
+          if git -C "$REPO_ROOT" log --format='%s' "origin/develop..refs/heads/$wt_branch" 2>/dev/null | grep -qxF "$main_latest_msg"; then
+            matched_branch="$wt_branch"
+            break
+          fi
+        done < "$WT_LIST_FILE"
       fi
-    done < "$WT_LIST_FILE"
+    fi
   fi
 
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
