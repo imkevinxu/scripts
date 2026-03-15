@@ -137,7 +137,7 @@ decode_arrow() {
 }
 
 print_status() {
-  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6" dev_behind="${7:-0}"
+  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6" dev_behind="${7:-0}" dev_ahead="${8:-0}"
 
   # Ahead/behind tracking branch
   local ahead=0 behind=0 upstream
@@ -190,6 +190,9 @@ print_status() {
   if (( dev_behind > 0 )); then
     (( display_len += 12 + ${#dev_behind} ))
   fi
+  if (( dev_ahead > 0 )); then
+    (( display_len += 2 + ${#dev_ahead} ))
+  fi
 
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
@@ -214,6 +217,9 @@ print_status() {
   fi
   if (( dev_behind > 0 )); then
     printf "  ${YELLOW}develop ↓ %d${R}" "$dev_behind"
+  fi
+  if (( dev_ahead > 0 )); then
+    printf " ${GREEN}+%d${R}" "$dev_ahead"
   fi
   printf "%-${pad}s" ""
   [[ -n "$age_str" ]] && printf "${DIM}%3s${R}" "$age_str"
@@ -260,7 +266,7 @@ print_status() {
 }
 
 print_orphan_pr() {
-  local branch="$1" pr_num="$2" pr_url="$3" pr_state="$4" pr_ci="$5" commit_ts="$6" is_draft="$7"
+  local branch="$1" pr_num="$2" pr_url="$3" pr_state="$4" pr_ci="$5" commit_ts="$6" is_draft="$7" dev_ahead="${8:-0}"
 
   local age_str=""
   if (( commit_ts > 0 )); then
@@ -271,6 +277,9 @@ print_orphan_pr() {
   (( display_len += 4 + ${#pr_num} ))
   [[ -n "$is_draft" ]] && (( display_len += 6 ))
   [[ -n "$pr_ci" || "$pr_state" == "MERGED" ]] && (( display_len += 2 ))
+  if (( dev_ahead > 0 )); then
+    (( display_len += 2 + ${#dev_ahead} ))
+  fi
 
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
@@ -290,6 +299,9 @@ print_orphan_pr() {
       fail)    printf " ${RED}✗${R}" ;;
       pending) printf " ${YELLOW}○${R}" ;;
     esac
+  fi
+  if (( dev_ahead > 0 )); then
+    printf " ${GREEN}+%d${R}" "$dev_ahead"
   fi
   printf "%-${pad}s" ""
   [[ -n "$age_str" ]] && printf "${DIM}%3s${R}" "$age_str"
@@ -353,7 +365,9 @@ with open('$cache_file', 'w') as out:
     fi
   fi
 
-  # Collect worktrees: commit_ts \t type \t dir \t label \t branch
+  # Collect worktrees: commit_ts \t type \t dir \t label \t branch \t dev_ahead
+  local HAS_ORIGIN_DEV=0
+  git -C "$REPO_ROOT" rev-parse --verify origin/develop &>/dev/null && HAS_ORIGIN_DEV=1
   > "$WT_LIST_FILE"
   local wt_count=0
 
@@ -370,7 +384,9 @@ with open('$cache_file', 'w') as out:
         local wt_label="${wt_dir#"$REPO_ROOT"/.worktrees/}"
         # If label matches branch (e.g. kevin/foo dir → kevin/foo label), use basename
         [[ "$wt_label" == "$wt_branch" ]] && wt_label="${wt_branch##*/}"
-        printf '%s\tlocal\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$wt_label" "$wt_branch" >> "$WT_LIST_FILE"
+        local wt_dev_ahead=0
+        (( HAS_ORIGIN_DEV )) && wt_dev_ahead="$(git -C "$wt_dir" rev-list --count origin/develop..HEAD 2>/dev/null || echo 0)"
+        printf '%s\tlocal\t%s\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$wt_label" "$wt_branch" "$wt_dev_ahead" >> "$WT_LIST_FILE"
         (( wt_count++ ))
         ;;
       */.codex/worktrees/*)
@@ -386,7 +402,9 @@ with open('$cache_file', 'w') as out:
         if (( ${#codex_label} > MAX_CODEX_LABEL )); then
           codex_label="${codex_label:0:$((MAX_CODEX_LABEL - 1))}…"
         fi
-        printf '%s\tcodex\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$codex_label" "$wt_branch" >> "$WT_LIST_FILE"
+        local wt_dev_ahead=0
+        (( HAS_ORIGIN_DEV )) && wt_dev_ahead="$(git -C "$wt_dir" rev-list --count origin/develop..HEAD 2>/dev/null || echo 0)"
+        printf '%s\tcodex\t%s\t%s\t%s\t%s\n' "$wt_ts" "$wt_dir" "$codex_label" "$wt_branch" "$wt_dev_ahead" >> "$WT_LIST_FILE"
         (( wt_count++ ))
         ;;
     esac
@@ -408,7 +426,7 @@ with open('$cache_file', 'w') as out:
   if (( NOW_TS - last_pr > 60 )); then
     echo "$NOW_TS" > "$pr_stamp" 2>/dev/null || true
     local pr_branches=("$main_branch")
-    while IFS=$'\t' read -r _ _ _ _ wb; do
+    while IFS=$'\t' read -r _ _ _ _ wb _; do
       pr_branches+=("$wb")
     done < "$WT_LIST_FILE"
     (
@@ -448,22 +466,22 @@ with open('$cache_file', 'w') as out:
   local orphan_count=0
   if [[ -s "$MY_PR_FILE" ]]; then
     local wt_branches_list="$main_branch"
-    while IFS=$'\t' read -r _ _ _ _ wb; do
+    while IFS=$'\t' read -r _ _ _ _ wb _; do
       wt_branches_list+=$'\n'"$wb"
     done < "$WT_LIST_FILE"
     while IFS=$'\t' read -r op_branch op_num op_url op_state op_ci op_draft; do
       if printf '%s\n' "$wt_branches_list" | grep -qxF "$op_branch" 2>/dev/null; then
         continue
       fi
-      local op_ts
+      local op_ts op_dev_ahead=0
       op_ts="$(git -C "$REPO_ROOT" log -1 --format='%ct' "origin/$op_branch" 2>/dev/null || echo 0)"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$op_ts" "$op_branch" "$op_num" "$op_url" "$op_state" "$op_ci" "$op_draft" >> "$ORPHAN_PR_FILE"
+      (( HAS_ORIGIN_DEV )) && op_dev_ahead="$(git -C "$REPO_ROOT" rev-list --count origin/develop.."origin/$op_branch" 2>/dev/null || echo 0)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$op_ts" "$op_branch" "$op_num" "$op_url" "$op_state" "$op_ci" "$op_draft" "$op_dev_ahead" >> "$ORPHAN_PR_FILE"
       (( orphan_count++ ))
     done < "$MY_PR_FILE"
     (( orphan_count > 0 )) && sort -t$'\t' -k1,1rn -o "$ORPHAN_PR_FILE" "$ORPHAN_PR_FILE"
   fi
 
-  # develop branch sync status (computed here for inline display on main repo line)
   local dev_behind=0
   if git -C "$REPO_ROOT" rev-parse --verify develop &>/dev/null && \
      git -C "$REPO_ROOT" rev-parse --verify origin/develop &>/dev/null; then
@@ -479,8 +497,7 @@ with open('$cache_file', 'w') as out:
   if (( dev_behind > 0 )); then
     (( max_display += 12 + ${#dev_behind} ))
   fi
-
-  while IFS=$'\t' read -r _ _ _ wt_label wt_branch; do
+  while IFS=$'\t' read -r _ _ _ wt_label wt_branch wt_dev_ahead; do
     calc_display_len "$wt_label" "$wt_branch"
     local wd=$REPLY
     lookup_pr "$wt_branch"
@@ -488,14 +505,20 @@ with open('$cache_file', 'w') as out:
       (( wd += 4 + ${#PR_NUM} ))
       [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( wd += 2 ))
     fi
+    if (( ${wt_dev_ahead:-0} > 0 )); then
+      (( wd += 2 + ${#wt_dev_ahead} ))
+    fi
     (( wd > max_display )) && max_display=$wd
   done < "$WT_LIST_FILE"
 
-  while IFS=$'\t' read -r _ op_branch op_num _ op_state op_ci op_draft; do
+  while IFS=$'\t' read -r _ op_branch op_num _ op_state op_ci op_draft op_dev_ahead; do
     local wd=${#op_branch}
     (( wd += 4 + ${#op_num} ))
     [[ -n "$op_draft" ]] && (( wd += 6 ))
     [[ -n "$op_ci" || "$op_state" == "MERGED" ]] && (( wd += 2 ))
+    if (( ${op_dev_ahead:-0} > 0 )); then
+      (( wd += 2 + ${#op_dev_ahead} ))
+    fi
     (( wd > max_display )) && max_display=$wd
   done < "$ORPHAN_PR_FILE"
 
@@ -513,23 +536,23 @@ with open('$cache_file', 'w') as out:
     printf "  ${DIM}%s${R}\n" "$(printf '%*s' "$hr_width" '' | tr ' ' '─')"
 
     # Main repo (always first)
-    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch" "$dev_behind"
+    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch" "$dev_behind" "0"
 
     # Other worktrees sorted by activity
-    while IFS=$'\t' read -r ts wt_type wt_dir wt_label wt_branch; do
+    while IFS=$'\t' read -r ts wt_type wt_dir wt_label wt_branch wt_dev_ahead; do
       local session_key
       if [[ "$wt_type" == "codex" ]]; then
         session_key="__codex__/${wt_dir##*/}"
       else
         session_key="${wt_dir##*/}"
       fi
-      print_status "$wt_dir" "$wt_label" "$wt_type" "$session_key" "$ts" "$wt_branch"
+      print_status "$wt_dir" "$wt_label" "$wt_type" "$session_key" "$ts" "$wt_branch" "0" "${wt_dev_ahead:-0}"
     done < "$WT_LIST_FILE"
 
     # Orphan PRs (open, authored by me, no local worktree)
     if (( orphan_count > 0 )); then
-      while IFS=$'\t' read -r op_ts op_branch op_num op_url op_state op_ci op_draft; do
-        print_orphan_pr "$op_branch" "$op_num" "$op_url" "$op_state" "$op_ci" "$op_ts" "$op_draft"
+      while IFS=$'\t' read -r op_ts op_branch op_num op_url op_state op_ci op_draft op_dev_ahead; do
+        print_orphan_pr "$op_branch" "$op_num" "$op_url" "$op_state" "$op_ci" "$op_ts" "$op_draft" "${op_dev_ahead:-0}"
       done < "$ORPHAN_PR_FILE"
     fi
 
