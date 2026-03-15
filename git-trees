@@ -260,7 +260,7 @@ print_status() {
   (( behind > 0 )) && { badges+="${sep}${RED}↓  ${behind}${R}"; sep="  "; }
   (( staged > 0 )) && { badges+="${sep}${GREEN}●  ${staged} staged${R}"; sep="  "; }
   (( modified > 0 )) && { badges+="${sep}${YELLOW}●  ${modified} modified${R}"; sep="  "; }
-  (( untracked > 0 )) && { badges+="${sep}${DIM}+  ${untracked} untracked${R}"; sep="  "; }
+  (( untracked > 0 )) && { badges+="${sep}${DIM}+ ${untracked} untracked${R}"; sep="  "; }
   [[ -n "$badges" ]] && printf "    %b\n" "$badges"
   echo
 }
@@ -483,9 +483,8 @@ with open('$cache_file', 'w') as out:
   fi
 
   local dev_behind=0
-  if git -C "$REPO_ROOT" rev-parse --verify develop &>/dev/null && \
-     git -C "$REPO_ROOT" rev-parse --verify origin/develop &>/dev/null; then
-    dev_behind="$(git -C "$REPO_ROOT" rev-list --count develop..origin/develop 2>/dev/null || echo 0)"
+  if (( HAS_ORIGIN_DEV )); then
+    dev_behind="$(git -C "$REPO_ROOT" rev-list --count HEAD..origin/develop 2>/dev/null || echo 0)"
   fi
 
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
