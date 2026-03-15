@@ -137,7 +137,7 @@ decode_arrow() {
 }
 
 print_status() {
-  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6" dev_behind="${7:-0}" dev_ahead="${8:-0}"
+  local dir="$1" label="$2" wt_type="$3" session_key="$4" commit_ts="$5" branch="$6" dev_behind="${7:-0}" dev_ahead="${8:-0}" matched_branch="${9:-}"
 
   # Ahead/behind tracking branch
   local ahead=0 behind=0 upstream
@@ -193,7 +193,6 @@ print_status() {
   if (( dev_ahead > 0 )); then
     (( display_len += 2 + ${#dev_ahead} ))
   fi
-
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
 
@@ -256,7 +255,11 @@ print_status() {
       badges+="${RED}gone${R}"; sep="  "
     fi
   fi
-  (( ahead > 0 )) && { badges+="${sep}${GREEN}↑  ${ahead}${R}"; sep="  "; }
+  if (( ahead > 0 )); then
+    badges+="${sep}${GREEN}↑  ${ahead}${R}"
+    [[ -n "$matched_branch" ]] && badges+="  ${DIM}(${matched_branch})${R}"
+    sep="  "
+  fi
   (( behind > 0 )) && { badges+="${sep}${RED}↓  ${behind}${R}"; sep="  "; }
   (( staged > 0 )) && { badges+="${sep}${GREEN}●  ${staged} staged${R}"; sep="  "; }
   (( modified > 0 )) && { badges+="${sep}${YELLOW}●  ${modified} modified${R}"; sep="  "; }
@@ -487,6 +490,21 @@ with open('$cache_file', 'w') as out:
     dev_behind="$(git -C "$REPO_ROOT" rev-list --count HEAD..origin/develop 2>/dev/null || echo 0)"
   fi
 
+  # Detect if main repo HEAD matches a worktree branch (synced commits)
+  # Compare tree SHAs — handles cherry-picks where commit SHAs differ but content is identical
+  local main_tree_sha matched_branch=""
+  main_tree_sha="$(git -C "$REPO_ROOT" rev-parse HEAD^{tree} 2>/dev/null || true)"
+  if [[ -n "$main_tree_sha" ]]; then
+    while IFS=$'\t' read -r _ _ _ _ wt_branch _; do
+      local wt_tree
+      wt_tree="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$wt_branch^{tree}" 2>/dev/null || true)"
+      if [[ "$main_tree_sha" == "$wt_tree" ]]; then
+        matched_branch="$wt_branch"
+        break
+      fi
+    done < "$WT_LIST_FILE"
+  fi
+
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
   lookup_pr "$main_branch"
   if [[ -n "$PR_NUM" ]]; then
@@ -535,7 +553,7 @@ with open('$cache_file', 'w') as out:
     printf "  ${DIM}%s${R}\n" "$(printf '%*s' "$hr_width" '' | tr ' ' '─')"
 
     # Main repo (always first)
-    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch" "$dev_behind" "0"
+    print_status "$REPO_ROOT" "$REPO_NAME" "main" "__main__" "$main_commit_ts" "$main_branch" "$dev_behind" "0" "$matched_branch"
 
     # Other worktrees sorted by activity
     while IFS=$'\t' read -r ts wt_type wt_dir wt_label wt_branch wt_dev_ahead; do
