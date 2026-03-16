@@ -179,7 +179,7 @@ print_status() {
   local show_branch=0
   [[ "${branch##*/}" != "$label" ]] && show_branch=1
   calc_display_len "$label" "$branch"
-  local display_len=$REPLY
+  local display_len=$REPLY name_len=$REPLY
 
   # PR lookup
   lookup_pr "$branch"
@@ -192,6 +192,24 @@ print_status() {
   fi
   if (( dev_ahead > 0 )); then
     (( display_len += 2 + ${#dev_ahead} ))
+  fi
+  # Truncate label to fit terminal width
+  local extras_len=$(( display_len - name_len ))
+  local max_name=$(( AGE_COL - 4 - extras_len ))
+  if (( name_len > max_name && max_name > 3 )); then
+    if (( show_branch )); then
+      show_branch=0
+      if (( ${#label} > max_name )); then
+        label="${label:0:$((max_name - 1))}…"
+        name_len=$max_name
+      else
+        name_len=${#label}
+      fi
+    else
+      label="${label:0:$((max_name - 1))}…"
+      name_len=$max_name
+    fi
+    display_len=$(( name_len + extras_len ))
   fi
   local pad=$(( AGE_COL - 2 - display_len ))
   (( pad < 2 )) && pad=2
@@ -282,6 +300,14 @@ print_orphan_pr() {
   [[ -n "$pr_ci" || "$pr_state" == "MERGED" ]] && (( display_len += 2 ))
   if (( dev_ahead > 0 )); then
     (( display_len += 2 + ${#dev_ahead} ))
+  fi
+  # Truncate branch name to fit terminal width
+  local name_len=${#branch}
+  local extras_len=$(( display_len - name_len ))
+  local max_name=$(( AGE_COL - 4 - extras_len ))
+  if (( name_len > max_name && max_name > 3 )); then
+    branch="${branch:0:$((max_name - 1))}…"
+    display_len=$(( ${#branch} + extras_len ))
   fi
 
   local pad=$(( AGE_COL - 2 - display_len ))
@@ -559,6 +585,8 @@ with open('$cache_file', 'w') as out:
 
   AGE_COL=$(( max_display + 4 ))
   (( AGE_COL < 45 )) && AGE_COL=45
+  (( AGE_COL > TERM_W - 5 )) && AGE_COL=$(( TERM_W - 5 ))
+  (( AGE_COL < 10 )) && AGE_COL=10
 
   {
     echo  # blank row — some terminals hide row 1 in alt screen
@@ -599,8 +627,9 @@ with open('$cache_file', 'w') as out:
 SCROLL_OFFSET=0
 TOTAL_LINES=0
 TERM_H=0
+TERM_W=80
 IS_REFRESHING=0
-update_term_h() { TERM_H=$(tput lines); (( TERM_H < 3 )) && TERM_H=3 || true; }
+update_term_h() { TERM_H=$(tput lines); TERM_W=$(tput cols); (( TERM_H < 3 )) && TERM_H=3 || true; (( TERM_W < 20 )) && TERM_W=20 || true; }
 
 paint() {
   local visible start end
@@ -636,6 +665,7 @@ paint() {
 
 # Single run
 if (( INTERVAL == 0 )); then
+  update_term_h
   render_to_file
   cat "$RENDER_FILE"
   rm -f "${TMP_FILES[@]}"
