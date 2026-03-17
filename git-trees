@@ -504,6 +504,19 @@ with open('$cache_file', 'w') as out:
       if printf '%s\n' "$wt_branches_list" | grep -qxF "$op_branch" 2>/dev/null; then
         continue
       fi
+      # Fuzzy match: PR branch like claude/foo-XXXXX → worktree dir foo
+      local op_basename="${op_branch##*/}"
+      local best_wt_branch="" best_len=0
+      while IFS=$'\t' read -r _ _ fwt_dir _ fwt_branch _; do
+        local fwt_stem="${fwt_dir##*/}"
+        if [[ ("$op_basename" == "$fwt_stem" || "$op_basename" == "${fwt_stem}-"*) && ${#fwt_stem} -gt $best_len ]]; then
+          best_wt_branch="$fwt_branch" best_len=${#fwt_stem}
+        fi
+      done < "$WT_LIST_FILE"
+      if [[ -n "$best_wt_branch" ]]; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$best_wt_branch" "$op_num" "$op_url" "$op_state" "$op_ci" >> "$PR_MAP_FILE"
+        continue
+      fi
       local op_ts op_dev_ahead=0
       op_ts="$(git -C "$REPO_ROOT" log -1 --format='%ct' "origin/$op_branch" 2>/dev/null || echo 0)"
       (( HAS_ORIGIN_DEV )) && op_dev_ahead="$(git -C "$REPO_ROOT" rev-list --count origin/develop.."origin/$op_branch" 2>/dev/null || echo 0)"
