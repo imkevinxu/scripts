@@ -181,8 +181,12 @@ print_status() {
   calc_display_len "$label" "$branch"
   local display_len=$REPLY name_len=$REPLY
 
-  # PR lookup
-  lookup_pr "$branch"
+  # PR lookup (skip for main repo — it shows whatever branch is checked out, not a feature branch)
+  if [[ "$wt_type" == "main" ]]; then
+    PR_NUM="" PR_URL="" PR_STATE="" PR_CI=""
+  else
+    lookup_pr "$branch"
+  fi
   if [[ -n "$PR_NUM" ]]; then
     (( display_len += 4 + ${#PR_NUM} ))
     [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( display_len += 2 ))
@@ -563,11 +567,6 @@ with open('$cache_file', 'w') as out:
   fi
 
   local max_display=$(( ${#REPO_NAME} + 4 + ${#main_branch} ))
-  lookup_pr "$main_branch"
-  if [[ -n "$PR_NUM" ]]; then
-    (( max_display += 4 + ${#PR_NUM} ))
-    [[ -n "$PR_CI" || "$PR_STATE" == "MERGED" ]] && (( max_display += 2 ))
-  fi
   if (( dev_behind > 0 )); then
     (( max_display += 12 + ${#dev_behind} ))
   fi
