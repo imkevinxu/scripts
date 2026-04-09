@@ -415,6 +415,8 @@ with open('$cache_file', 'w') as out:
     case "$wt_dir" in
       "$REPO_ROOT"/*)
         local wt_label="${wt_dir#"$REPO_ROOT"/.worktrees/}"
+        # .claude/worktrees/agent-xxx → just show final dir name
+        [[ "$wt_label" == "$wt_dir" ]] && wt_label="${wt_dir##*/}"
         # If label matches branch (e.g. kevin/foo dir → kevin/foo label), use basename
         [[ "$wt_label" == "$wt_branch" ]] && wt_label="${wt_branch##*/}"
         local wt_dev_ahead=0
