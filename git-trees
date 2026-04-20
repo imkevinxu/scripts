@@ -258,12 +258,12 @@ print_status() {
         local s_mtime s_id s_alive
         IFS=$'\t' read -r _ s_mtime s_id s_alive <<< "$session_line"
         format_age $(( NOW_TS - s_mtime )); local s_age="$REPLY"
-        local s_pad=$(( AGE_COL - 4 - 1 - 2 - ${#s_id} ))
-        (( s_pad < 2 )) && s_pad=2
+        # Use absolute-column escape (CHA) to align age — avoids icon display-width ambiguity
+        local s_age_col=$(( AGE_COL + 1 ))
         if (( s_alive )); then
-          printf "\n    ${CLAUDE_ORANGE}${SESSION_ICON}${R}  ${DIM}%s%*s%3s${R}" "$s_id" "$s_pad" "" "$s_age"
+          printf "\n    ${CLAUDE_ORANGE}${SESSION_ICON}${R}  ${DIM}%s\e[%dG%3s${R}" "$s_id" "$s_age_col" "$s_age"
         else
-          printf "\n    ${DIM}${SESSION_ICON}  %s%*s%3s${R}" "$s_id" "$s_pad" "" "$s_age"
+          printf "\n    ${DIM}${SESSION_ICON}  %s\e[%dG%3s${R}" "$s_id" "$s_age_col" "$s_age"
         fi
       done <<< "$session_lines"
     fi
