@@ -353,7 +353,7 @@ render_to_file() {
   fi
   if (( NOW_TS - last_fetch > 30 )); then
     [[ -n "${FETCH_PID:-}" ]] && wait "$FETCH_PID" 2>/dev/null || true
-    git -C "$REPO_ROOT" fetch --quiet 2>/dev/null &
+    GIT_TERMINAL_PROMPT=0 git -C "$REPO_ROOT" fetch --quiet 2>/dev/null &
     FETCH_PID=$!
     echo "$NOW_TS" > "$fetch_stamp" 2>/dev/null || true
   fi
